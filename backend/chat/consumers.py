@@ -8,59 +8,131 @@ from .serializers import MessageSerializer, ConversationSerializer
 from asgiref.sync import sync_to_async
 from django.urls import reverse
 from django.conf import settings
+from django.utils import timezone
 import random
 from channels.db import database_sync_to_async
 from django.shortcuts import get_object_or_404
 from rest_framework_simplejwt.tokens import UntypedToken
 from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
 from urllib.parse import parse_qs
+from .tasks import create_and_schedule_email_notification, cancel_pending_notifications_for_message
+
+# JWT authentication is now handled by middleware
 
 @database_sync_to_async
-def get_user_from_jwt(token_string):
-    """Get user from JWT token for WebSocket authentication"""
-    try:
-        UntypedToken(token_string)
-        from rest_framework_simplejwt.authentication import JWTAuthentication
-        jwt_auth = JWTAuthentication()
-        validated_token = jwt_auth.get_validated_token(token_string)
-        user = jwt_auth.get_user(validated_token)
-        return user
-    except (InvalidToken, TokenError):
-        return None
-
 def generate_unique_phone_number():
     while True:
         number = f"03{random.randint(100000000, 999999999)}"
         if not UserProfile.objects.filter(phone_number=number).exists():
             return number
 
+def schedule_email_notification_sync(message_id):
+    """Schedule email notification task - synchronous version"""
+    try:
+        # Only try to schedule if Celery is working
+        return create_and_schedule_email_notification.delay(message_id)
+    except Exception as e:
+        # Log the error but don't break the messaging functionality
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(f"Failed to schedule email notification for message {message_id}: {str(e)}")
+        return None
+
+def cancel_email_notifications_sync(message_id):
+    """Cancel email notifications task - synchronous version"""
+    try:
+        # Only try to cancel if Celery is working
+        return cancel_pending_notifications_for_message.delay(message_id)
+    except Exception as e:
+        # Log the error but don't break the messaging functionality
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(f"Failed to cancel email notifications for message {message_id}: {str(e)}")
+        return None
+
+@database_sync_to_async
+def get_user_by_username(username):
+    return User.objects.get(username=username)
+
+@database_sync_to_async
+def get_userprofile_by_user(user):
+    return UserProfile.objects.get(user=user)
+
+@database_sync_to_async
+def get_conversation_by_id(conversation_id):
+    return Conversation.objects.get(id=conversation_id)
+
+@database_sync_to_async
+def get_message_by_id(message_id):
+    return get_object_or_404(Message, id=message_id)
+
+@database_sync_to_async
+def update_message_content(message, content):
+    message.content = content.strip()
+    message.save()
+
+@database_sync_to_async
+def delete_message(message):
+    message.delete()
+
+@database_sync_to_async
+def get_messages_by_ids(message_ids, recipient_profile):
+    return list(Message.objects.filter(
+        id__in=message_ids,
+        recipient=recipient_profile,
+        is_read=False
+    ))
+
+@database_sync_to_async
+def mark_messages_as_read(message_ids):
+    return Message.objects.filter(id__in=message_ids).update(is_read=True)
+
 class ChatConsumer(AsyncWebsocketConsumer):
     async def connect(self):
-        # Get token from query string for JWT authentication
-        query_string = self.scope['query_string'].decode()
-        query_params = parse_qs(query_string)
-        token = query_params.get('token', [None])[0]
+        # Get authenticated user from middleware
+        self.user = self.scope.get('user')
         
-        if token:
-            self.user = await get_user_from_jwt(token)
-            if self.user and not self.user.is_anonymous:
-                self.conversation_id = self.scope['url_route']['kwargs']['conversation_id']
-                self.room_group_name = f'chat_{self.conversation_id}'
-                await self.channel_layer.group_add(
-                    self.room_group_name,
-                    self.channel_name
-                )
-                await self.accept()
-            else:
-                await self.close()
+        if self.user and not self.user.is_anonymous:
+            self.conversation_id = self.scope['url_route']['kwargs']['conversation_id']
+            self.room_group_name = f'chat_{self.conversation_id}'
+            await self.channel_layer.group_add(
+                self.room_group_name,
+                self.channel_name
+            )
+            
+            # Only mark user as online when connecting if they have valid authentication
+            # This prevents users from appearing online after they've logged out
+            try:
+                user_profile = await database_sync_to_async(UserProfile.objects.get)(user=self.user)
+                # Only set online if user has a valid session/token - 
+                # the middleware already validates the JWT token, so if we reach here, user is authenticated
+                user_profile.is_online = True
+                user_profile.last_seen = timezone.now()
+                await database_sync_to_async(user_profile.save)(update_fields=['is_online', 'last_seen'])
+            except UserProfile.DoesNotExist:
+                pass  # User profile doesn't exist yet
+            
+            await self.accept()
         else:
-            await self.close()
+            await self.close(code=4001)  # Unauthorized
 
     async def disconnect(self, close_code):
-        await self.channel_layer.group_discard(
-            self.room_group_name,
-            self.channel_name
-        )
+        # Mark user as offline when disconnecting
+        if hasattr(self, 'user') and self.user and not self.user.is_anonymous:
+            try:
+                user_profile = await database_sync_to_async(UserProfile.objects.get)(user=self.user)
+                user_profile.is_online = False
+                user_profile.last_seen = timezone.now()
+                await database_sync_to_async(user_profile.save)(update_fields=['is_online', 'last_seen'])
+            except UserProfile.DoesNotExist:
+                pass  # User profile doesn't exist yet
+        
+        # Only try to leave group if connection was established
+        if hasattr(self, 'room_group_name'):
+            await self.channel_layer.group_discard(
+                self.room_group_name,
+                self.channel_name
+            )
 
     async def receive(self, text_data):
         try:
@@ -103,24 +175,24 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 return
 
             # Find sender User
-            sender_user = await sync_to_async(User.objects.get)(username=sender_username)
+            sender_user = await database_sync_to_async(User.objects.get)(username=sender_username)
             
             # Get or create UserProfile for sender
             try:
-                sender_profile = await sync_to_async(UserProfile.objects.get)(user=sender_user)
+                sender_profile = await database_sync_to_async(UserProfile.objects.get)(user=sender_user)
             except UserProfile.DoesNotExist:
                 # Create profile if it doesn't exist (for Google users)
-                phone = await sync_to_async(generate_unique_phone_number)()
-                sender_profile = await sync_to_async(UserProfile.objects.create)(
+                phone = await generate_unique_phone_number()
+                sender_profile = await database_sync_to_async(UserProfile.objects.create)(
                     user=sender_user,
                     phone_number=phone
                 )
 
             # Fetch conversation
-            conversation = await sync_to_async(Conversation.objects.get)(id=self.conversation_id)
+            conversation = await database_sync_to_async(Conversation.objects.get)(id=self.conversation_id)
 
             # Find recipient: all participants except the sender
-            participants = await sync_to_async(lambda: list(conversation.participants.all()))()
+            participants = await database_sync_to_async(lambda: list(conversation.participants.all()))()
             recipient_profiles = [p for p in participants if p.id != sender_profile.id]
             
             if not recipient_profiles:
@@ -135,7 +207,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 audio_data = base64.b64decode(audio_data_base64)
 
             # Create the message
-            message = await sync_to_async(Message.objects.create)(
+            message = await database_sync_to_async(Message.objects.create)(
                 conversation=conversation,
                 sender=sender_user,
                 recipient=recipient_profile,
@@ -145,9 +217,9 @@ class ChatConsumer(AsyncWebsocketConsumer):
             )
 
             # Auto-restore conversation for participants who deleted it
-            for participant in await sync_to_async(lambda: list(conversation.participants.all()))():
-                if await sync_to_async(lambda: participant in conversation.deleted_by.all())():
-                    await sync_to_async(conversation.deleted_by.remove)(participant)
+            for participant in await database_sync_to_async(lambda: list(conversation.participants.all()))():
+                if await database_sync_to_async(lambda: participant in conversation.deleted_by.all())():
+                    await database_sync_to_async(conversation.deleted_by.remove)(participant)
                     # DO NOT clear deletion timestamp - keep it so user only sees messages after deletion
                     # The deletion timestamp should persist even after restoration
 
@@ -178,6 +250,8 @@ class ChatConsumer(AsyncWebsocketConsumer):
             if message.message_type == 'audio' and message.audio_data:
                 import base64
                 response_data["audio_data_base64"] = base64.b64encode(message.audio_data).decode('utf-8')
+
+            # Email notifications are now handled automatically by Django signals
 
             # Broadcast to the group
             await self.channel_layer.group_send(
@@ -210,29 +284,26 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 return
                 
             # Get the sender user
-            sender_user = await sync_to_async(User.objects.get)(username=sender_username)
+            sender_user = await get_user_by_username(sender_username)
             
             # Get the message and verify ownership
-            message = await sync_to_async(lambda: get_object_or_404(Message, id=message_id))()
-            message_sender = await sync_to_async(lambda: message.sender)()
+            message = await get_message_by_id(message_id)
             
-            if message_sender.id != sender_user.id:
+            if message.sender.id != sender_user.id:
                 await self.send(text_data=json.dumps({
                     'error': 'You do not have permission to edit this message'
                 }))
                 return
                 
             # Verify message type is text
-            message_type = await sync_to_async(lambda: message.message_type)()
-            if message_type != 'text':
+            if message.message_type != 'text':
                 await self.send(text_data=json.dumps({
                     'error': 'Only text messages can be edited'
                 }))
                 return
                 
             # Update the message
-            await sync_to_async(lambda: setattr(message, 'content', content.strip()))()
-            await sync_to_async(message.save)()
+            await update_message_content(message, content)
             
             # Prepare response data
             response_data = {
@@ -240,7 +311,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 'id': message_id,
                 'content': content.strip(),
                 'sender_username': sender_username,
-                'timestamp': await sync_to_async(lambda: message.timestamp.isoformat())(),
+                'timestamp': message.timestamp.isoformat(),
                 'message_type': 'text'
             }
             
@@ -272,20 +343,19 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 return
                 
             # Get the sender user
-            sender_user = await sync_to_async(User.objects.get)(username=sender_username)
+            sender_user = await get_user_by_username(sender_username)
             
             # Get the message and verify ownership
-            message = await sync_to_async(lambda: get_object_or_404(Message, id=message_id))()
-            message_sender = await sync_to_async(lambda: message.sender)()
+            message = await get_message_by_id(message_id)
             
-            if message_sender.id != sender_user.id:
+            if message.sender.id != sender_user.id:
                 await self.send(text_data=json.dumps({
                     'error': 'You do not have permission to delete this message'
                 }))
                 return
                 
             # Delete the message
-            await sync_to_async(message.delete)()
+            await delete_message(message)
             
             # Prepare response data
             response_data = {
@@ -358,25 +428,20 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 return
             
             # Get the reader user
-            reader_user = await sync_to_async(User.objects.get)(username=reader_username)
-            reader_profile = await sync_to_async(UserProfile.objects.get)(user=reader_user)
+            reader_user = await get_user_by_username(reader_username)
+            reader_profile = await get_userprofile_by_user(reader_user)
             
             # Mark messages as read
-            messages = await sync_to_async(lambda: list(
-                Message.objects.filter(
-                    id__in=message_ids,
-                    recipient=reader_profile,
-                    is_read=False
-                )
-            ))()
+            messages = await get_messages_by_ids(message_ids, reader_profile)
             
             if messages:
                 # Update messages to read
-                await sync_to_async(lambda: Message.objects.filter(
-                    id__in=[msg.id for msg in messages]
-                ).update(is_read=True))()
+                message_ids_to_update = [msg.id for msg in messages]
+                await mark_messages_as_read(message_ids_to_update)
                 
-                # Broadcast read receipts
+                # Cancel pending email notifications for read messages
+                for message in messages:
+                    await sync_to_async(cancel_email_notifications_sync)(message.id)
                 for message in messages:
                     await self.channel_layer.group_send(
                         self.room_group_name,
@@ -413,24 +478,43 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
 class ConversationListConsumer(AsyncWebsocketConsumer):
     async def connect(self):
-        # Get user from the auth middleware
-        self.user = self.scope["user"]
-        if self.user.is_anonymous:
-            await self.close()
-            return
+        # Get authenticated user from middleware
+        self.user = self.scope.get('user')
         
-        # Create a unique group for this user's conversation updates
-        self.user_group_name = f'user_conversations_{self.user.id}'
-        
-        # Join user-specific conversation group
-        await self.channel_layer.group_add(
-            self.user_group_name,
-            self.channel_name
-        )
-        
-        await self.accept()
+        if self.user and not self.user.is_anonymous:
+            # Create a unique group for this user's conversation updates
+            self.user_group_name = f'user_conversations_{self.user.id}'
+            
+            # Join user-specific conversation group
+            await self.channel_layer.group_add(
+                self.user_group_name,
+                self.channel_name
+            )
+            
+            # Mark user as online when connecting to conversation list (main presence indicator)
+            try:
+                user_profile = await database_sync_to_async(UserProfile.objects.get)(user=self.user)
+                user_profile.is_online = True
+                user_profile.last_seen = timezone.now()
+                await database_sync_to_async(user_profile.save)(update_fields=['is_online', 'last_seen'])
+            except UserProfile.DoesNotExist:
+                pass  # User profile doesn't exist yet
+            
+            await self.accept()
+        else:
+            await self.close(code=4001)  # Unauthorized
     
     async def disconnect(self, close_code):
+        # Mark user as offline when disconnecting from conversation list
+        if hasattr(self, 'user') and self.user and not self.user.is_anonymous:
+            try:
+                user_profile = await database_sync_to_async(UserProfile.objects.get)(user=self.user)
+                user_profile.is_online = False
+                user_profile.last_seen = timezone.now()
+                await database_sync_to_async(user_profile.save)(update_fields=['is_online', 'last_seen'])
+            except UserProfile.DoesNotExist:
+                pass  # User profile doesn't exist yet
+        
         # Leave user-specific conversation group
         if hasattr(self, 'user_group_name'):
             await self.channel_layer.group_discard(
@@ -439,11 +523,31 @@ class ConversationListConsumer(AsyncWebsocketConsumer):
             )
     
     async def receive(self, text_data):
-        # This consumer mainly listens for updates, but can handle ping/pong
+        # Handle ping/pong and heartbeat messages
         try:
             data = json.loads(text_data)
-            if data.get('type') == 'ping':
+            message_type = data.get('type')
+            
+            if message_type == 'ping':
+                # Update last_seen time on heartbeat
+                if hasattr(self, 'user') and self.user and not self.user.is_anonymous:
+                    try:
+                        user_profile = await database_sync_to_async(UserProfile.objects.get)(user=self.user)
+                        user_profile.last_seen = timezone.now()
+                        await database_sync_to_async(user_profile.save)(update_fields=['last_seen'])
+                    except UserProfile.DoesNotExist:
+                        pass
+                
                 await self.send(text_data=json.dumps({'type': 'pong'}))
+            elif message_type == 'heartbeat':
+                # Update user activity timestamp
+                if hasattr(self, 'user') and self.user and not self.user.is_anonymous:
+                    try:
+                        user_profile = await database_sync_to_async(UserProfile.objects.get)(user=self.user)
+                        user_profile.last_seen = timezone.now()
+                        await database_sync_to_async(user_profile.save)(update_fields=['last_seen'])
+                    except UserProfile.DoesNotExist:
+                        pass
         except json.JSONDecodeError:
             pass
     

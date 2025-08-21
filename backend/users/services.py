@@ -52,18 +52,41 @@ def get_user_data(validated_data):
     access_token = google_get_access_token(code=code, redirect_uri=redirect_uri)
     user_data = google_get_user_info(access_token=access_token)
 
-    # Create user or get existing one
-    user, created = User.objects.get_or_create(
-        email=user_data['email'],
-        defaults={
-            'username': user_data['email'],
-            'first_name': user_data.get('given_name'),
-            'last_name': user_data.get('family_name')
-        }
-    )
+    # Handle potential duplicate users for Google login
+    email = user_data['email']
+    
+    # Try to get existing users with this email
+    existing_users = User.objects.filter(email=email)
+    
+    if existing_users.exists():
+        # If multiple users exist, use the most recent one
+        user = existing_users.order_by('-date_joined').first()
+        created = False
+        
+        # Update user info from Google if needed
+        if user_data.get('given_name') and not user.first_name:
+            user.first_name = user_data.get('given_name')
+        if user_data.get('family_name') and not user.last_name:
+            user.last_name = user_data.get('family_name')
+        user.save()
+    else:
+        # Create new user
+        user = User.objects.create(
+            email=email,
+            username=email,  # Use email as username for Google users
+            first_name=user_data.get('given_name'),
+            last_name=user_data.get('family_name')
+        )
+        created = True
 
     # Ensure profile exists even if user already existed
-    UserProfile.objects.get_or_create(user=user)
+    profile, profile_created = UserProfile.objects.get_or_create(user=user)
+    
+    # Mark user as online when logging in via Google
+    try:
+        profile.set_online()
+    except:
+        pass  # Handle any potential errors
 
     # Generate JWT tokens instead of session
     refresh = RefreshToken.for_user(user)

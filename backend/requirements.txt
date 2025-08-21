@@ -17,6 +17,8 @@ certifi==2025.7.9
 cffi==1.17.1
 channels==4.2.2
 channels_redis==4.2.1
+celery==5.3.4
+celery[redis]==5.3.4
 charset-normalizer==3.4.2
 click==8.2.0
 colorama==0.4.6

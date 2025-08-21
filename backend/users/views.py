@@ -106,6 +106,13 @@ class LogoutApi(APIView):
     
     def post(self, request, *args, **kwargs):
         try:
+            # Mark user as offline when logging out
+            try:
+                user_profile = request.user.userprofile
+                user_profile.set_offline()
+            except:
+                pass  # User profile doesn't exist or other error
+            
             # Try to blacklist the refresh token if provided
             refresh_token = request.data.get("refresh")
             if refresh_token:
@@ -116,6 +123,13 @@ class LogoutApi(APIView):
             logout(request)
             return JsonResponse({'message': 'Logged out successfully'}, status=200)
         except (TokenError, InvalidToken):
+            # Mark user as offline even if token blacklisting fails
+            try:
+                user_profile = request.user.userprofile
+                user_profile.set_offline()
+            except:
+                pass  # User profile doesn't exist or other error
+            
             # Even if token blacklisting fails, still logout successfully
             logout(request)
             return JsonResponse({'message': 'Logged out successfully'}, status=200)
@@ -201,6 +215,13 @@ class ManualLoginView(APIView):
         user = authenticate(request, username=user.username, password=password)
 
         if user is not None:
+            # Mark user as online when logging in
+            try:
+                user_profile = user.userprofile
+                user_profile.set_online()
+            except:
+                pass  # User profile doesn't exist or other error
+            
             # Return JWT tokens instead of creating session
             return create_jwt_response(user, "Login successful")
         else:

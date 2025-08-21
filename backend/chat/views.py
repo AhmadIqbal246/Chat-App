@@ -10,6 +10,7 @@ from .models import Conversation, Message
 from .serializers import MessageSerializer, ConversationSerializer
 from django.shortcuts import get_object_or_404
 from .utils import send_conversation_update, send_conversation_delete
+from .tasks import create_and_schedule_email_notification
 import json
 from django.utils import timezone
 class SendMessageView(APIView):
@@ -75,6 +76,8 @@ class SendMessageView(APIView):
                 conversation.deleted_by.remove(participant)
                 # DO NOT clear deletion timestamp - keep it so user only sees messages after deletion
 
+        # Email notifications are now handled automatically by Django signals
+        
         # Send real-time conversation update to all participants
         send_conversation_update(conversation, is_new=is_new_conversation, request=request)
         
@@ -252,6 +255,8 @@ class SendMessageInConversationView(APIView):
                 # DO NOT clear deletion timestamp - keep it so user only sees messages after deletion
                 # The deletion timestamp should persist even after restoration
 
+        # Email notifications are now handled automatically by Django signals
+            
         # Send real-time conversation update (not new, just update)
         send_conversation_update(conversation, is_new=False, request=request)
         
